@@ -30,11 +30,10 @@ room_naming:
   drift_threshold: 2          # min conflicting indicator objects to trigger re-naming
   indicator_conf_threshold: 0.5  # min object confidence to count as an indicator
   indicator_map:
-    living_room: ['sofa', 'couch', 'coffee table', 'television', 'tv', 'fireplace', 'end table', 'armchair']
-    kitchen: ['refrigerator', 'stove', 'oven', 'microwave', 'sink', 'dishwasher', 'cabinet', 'blender', 'toaster']
-    bedroom: ['bed', 'wardrobe', 'nightstand', 'dresser', 'pillow', 'blanket']
-    bathroom: ['toilet', 'shower', 'bathtub', 'bathroom sink', 'towel rack', 'mirror']
-    dining_room: ['dining table', 'chair', 'chandelier']
+    living_room: ['sofa', 'couch', 'television', 'tv', 'fireplace']
+    kitchen: ['refrigerator', 'stove', 'oven', 'microwave', 'dishwasher']
+    bedroom: ['bed', 'wardrobe']
+    bathroom: ['toilet', 'shower', 'bathtub']
 
 # camera, image
 camera_height: 1.5
