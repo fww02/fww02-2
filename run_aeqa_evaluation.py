@@ -143,6 +143,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
         # Apply room naming config switch
         if hasattr(cfg, 'enable_room_naming'):
             emg.enable_room_naming = bool(cfg.enable_room_naming)
+        # Load drift detection config from yaml
+        if hasattr(cfg, 'room_naming'):
+            try:
+                emg.configure_drift_detection(cfg.room_naming)
+            except Exception as _e:
+                logging.warning(f"configure_drift_detection failed: {_e}")
 
         logging.info(f"\n\nQuestion id {question_id} initialization successful!")
 
@@ -253,9 +259,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
                 f"Step {cnt_step}, update snapshots, {len(scene.objects)} objects, {len(scene.snapshots)} snapshots"
             )
 
-            # (2.5) Assign room IDs to snapshots via majority vote
+            # (2.5) Assign room IDs to snapshots via distance-weighted voting
             if hasattr(emg, 'obj_to_region'):
-                scene.update_snapshot_rooms(emg.obj_to_region)
+                scene.update_snapshot_rooms(emg.obj_to_region, agent_pts=pts)
 
             # (3) Update the Frontier Snapshots
             update_success = tsdf_planner.update_frontier_map(
