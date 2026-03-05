@@ -56,21 +56,34 @@ def query_vlm_for_response(
         else:
             base_label = "unknown area"
 
-        # Detect semantic conflict: objects in this snapshot that belong to a different room type
+        # Detect semantic conflict: only annotate if conflicting objects exceed 30% of valid objects
         if class_to_room_type and snapshot.room_name is not None:
             current_type = snapshot.room_name.replace(" ", "_").lower()
-            conflict_types = set()
+            conflict_type_to_objs: dict = {}
+            total_valid = 0
             for obj_id in snapshot.cluster:
                 obj = scene.objects.get(obj_id, {})
                 cn = obj.get("class_name", None) if obj else None
                 if cn is None:
                     continue
+                total_valid += 1
                 assigned_type = class_to_room_type.get(cn)
                 if assigned_type is not None and assigned_type != current_type:
-                    conflict_types.add(assigned_type.replace("_", " "))
-            if conflict_types:
-                conflict_str = ", ".join(sorted(conflict_types))
-                base_label = f"{base_label}, contains {conflict_str} objects"
+                    conflict_type_to_objs.setdefault(assigned_type, []).append(cn)
+            # Only annotate if there are valid objects AND conflict ratio > 30%
+            if total_valid > 0:
+                total_conflict = sum(len(v) for v in conflict_type_to_objs.values())
+                conflict_ratio = total_conflict / total_valid
+                if conflict_ratio > 0.30 and conflict_type_to_objs:
+                    conflict_str = ", ".join(
+                        sorted(t.replace("_", " ") for t in conflict_type_to_objs)
+                    )
+                    logging.info(
+                        f"Snapshot (room='{snapshot.room_name}'): conflict ratio={conflict_ratio:.1%}, "
+                        f"conflicting types={conflict_str}, "
+                        f"conflicting objects={dict(conflict_type_to_objs)}"
+                    )
+                    base_label = f"{base_label}, contains {conflict_str} objects"
 
         step_dict["snapshot_room_labels"][rgb_id] = base_label
 
