@@ -65,6 +65,8 @@ class SnapShot:
     )  # object id to confidence
     cluster: List[int] = field(default_factory=list)
     position: np.ndarray = None
+    room_id: Optional[int] = None  # region id from explicit memory graph
+    room_name: Optional[str] = None  # inferred human-readable room name (e.g. "kitchen")
 
     def __eq__(self, other):
         raise NotImplementedError("Cannot compare SnapShot objects.")
