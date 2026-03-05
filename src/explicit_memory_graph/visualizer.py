@@ -367,15 +367,20 @@ class SceneGraphVisualizer:
         # ==================== 图像设置 ====================
         fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
         fig.patch.set_facecolor('white')
-        
+
+        # ── 自动裁剪：使有效房间区域占据图像 ≥80% ──────────────────────────
+        top_down_map, (_v1_y0, _v1_y1, _v1_x0, _v1_x1) = self._autocrop_topdown_map(
+            top_down_map, margin_ratio=0.04, target_fill_ratio=0.78
+        )
+
         # 绘制底图
         ax.imshow(top_down_map, origin="upper", interpolation='bilinear')
         map_shape = top_down_map.shape[:2]  # (H, W)
-        
-        # 动态计算节点大小（基于地图尺寸，确保视觉协调）
+
+        # 动态计算节点大小（裁剪后地图更紧凑，节点应更小）
         map_diag = np.sqrt(map_shape[0]**2 + map_shape[1]**2)
-        base_radius = max(10, min(20, map_diag / 80))  # 中等大小节点
-        trajectory_width = base_radius * 1.2  # 粗壮轨迹线
+        base_radius = max(6, min(12, map_diag / 100))  # 更小的节点
+        trajectory_width = max(1.5, base_radius * 0.6)  # 更细的轨迹线
         
         # ==================== Layer 1: 轨迹线（底层）====================
         # 在相邻蓝色图像节点之间绘制粗壮的浅蓝色半透明色带
@@ -454,65 +459,27 @@ class SceneGraphVisualizer:
                 )
                 ax.add_patch(circle)
 
-        # ==================== Layer 4: 对象节点（粉色等边三角形）====================
-        # 尖角朝上，表示从视觉中识别出的具体语义物体
+        # ==================== Layer 4: 对象节点（点云轮廓化显示）====================
+        # 使用真实点云投影轮廓替代粉色三角形，可分辨物体形状
         background_classes = {'wall', 'floor', 'ceiling', 'paneling', 'banner', 'misc', 'unknown'}
-        
-        if object_positions:
-            for obj_id, pos in object_positions.items():
-                # 跳过目标物体（单独绘制）
-                if target_object_id is not None and obj_id == target_object_id:
-                    continue
-                
-                # 过滤背景类
-                class_name = object_classes.get(obj_id, '') if object_classes else ''
-                if class_name.lower() in background_classes:
-                    continue
-                
-                px, py = self.world_to_pixel(pos, map_shape)
-                
-                # 等边三角形（尖角朝上）
-                triangle_size = base_radius * 0.85
-                # 顶点朝上的等边三角形顶点坐标
-                triangle = plt.Polygon(
-                    [
-                        (px, py - triangle_size * 1.15),  # 顶点（朝上）
-                        (px - triangle_size, py + triangle_size * 0.58),  # 左下
-                        (px + triangle_size, py + triangle_size * 0.58),  # 右下
-                    ],
-                    facecolor=COLOR_OBJECT_NODE,
-                    edgecolor=COLOR_OBJECT_NODE_EDGE,
-                    linewidth=2.0,
-                    alpha=0.88,
-                    zorder=15
-                )
-                ax.add_patch(triangle)
-                
-                # 可选：类别标签
-                if show_object_labels and class_name and class_name.lower() not in background_classes:
-                    ax.text(
-                        px, py + triangle_size * 1.5,
-                        class_name,
-                        fontsize=max(6, base_radius * 0.45),
-                        color='#2C3E50',
-                        fontweight='semibold',
-                        ha='center',
-                        va='top',
-                        bbox=dict(
-                            boxstyle='round,pad=0.15',
-                            facecolor='white',
-                            alpha=0.75,
-                            edgecolor='#BDC3C7',
-                            linewidth=0.8
-                        ),
-                        zorder=16
-                    )
+        self._draw_object_contours(
+            ax=ax,
+            object_positions=object_positions or {},
+            object_classes=object_classes,
+            scene_objects=None,  # V1 不传 scene_objects，回退为小圆点
+            map_shape=map_shape,
+            crop_offsets=(0, 0),
+            base_radius=base_radius,
+            target_object_id=target_object_id,
+            show_labels=show_object_labels,
+            background_classes=background_classes,
+        )
 
         # ==================== Layer 5: 目标节点（红色大圆圈 + 光晕）====================
         if target_object_id is not None and object_positions and target_object_id in object_positions:
             pos = object_positions[target_object_id]
             px, py = self.world_to_pixel(pos, map_shape)
-            
+
             # 半透明红色光晕（多层渐变，强调效果）
             for r_mult, alpha in [(3.5, 0.12), (2.8, 0.18), (2.2, 0.25), (1.7, 0.32)]:
                 halo = plt.Circle(
@@ -524,35 +491,35 @@ class SceneGraphVisualizer:
                     zorder=17
                 )
                 ax.add_patch(halo)
-            
+
             # 红色大圆圈（明显大于普通图像节点）
             target_circle = plt.Circle(
                 (px, py),
                 radius=base_radius * 1.4,
                 facecolor=COLOR_TARGET,
                 edgecolor='white',
-                linewidth=3.5,
+                linewidth=3.0,
                 alpha=0.95,
                 zorder=19
             )
             ax.add_patch(target_circle)
-            
+
             # 目标标签
             if object_classes and target_object_id in object_classes:
                 target_name = object_classes[target_object_id]
                 ax.text(
                     px, py - base_radius * 3.0,
                     f"Goal: {target_name}",
-                    fontsize=max(8, base_radius * 0.55),
+                    fontsize=max(7, base_radius * 0.5),
                     color='white',
                     fontweight='bold',
                     ha='center',
                     bbox=dict(
-                        boxstyle='round,pad=0.35',
+                        boxstyle='round,pad=0.3',
                         facecolor=COLOR_TARGET,
                         alpha=0.92,
                         edgecolor='white',
-                        linewidth=2
+                        linewidth=1.5
                     ),
                     zorder=20
                 )
@@ -560,7 +527,7 @@ class SceneGraphVisualizer:
         # ==================== Layer 6: 当前机器人位置（鲜绿色实心圆）====================
         if agent_position is not None:
             px, py = self.world_to_pixel(agent_position, map_shape)
-            
+
             # 鲜绿色实心圆（与蓝色图像节点明显区分）
             agent_circle = plt.Circle(
                 (px, py),
@@ -598,44 +565,42 @@ class SceneGraphVisualizer:
         # ==================== 图例 ====================
         if show_legend:
             legend_elements = [
-                plt.Line2D([0], [0], marker='o', color='w', 
-                           markerfacecolor=COLOR_IMAGE_NODE, markersize=14, 
-                           label='Image Node', markeredgecolor=COLOR_IMAGE_NODE_EDGE, 
-                           markeredgewidth=2, linestyle='None'),
-                plt.Line2D([0], [0], marker='^', color='w', 
-                           markerfacecolor=COLOR_OBJECT_NODE, markersize=14, 
-                           label='Object Node', markeredgecolor=COLOR_OBJECT_NODE_EDGE, 
-                           markeredgewidth=2, linestyle='None'),
-                plt.Line2D([0], [0], marker='o', color='w', 
-                           markerfacecolor=COLOR_AGENT, markersize=14, 
-                           label='Current Position', markeredgecolor=COLOR_AGENT_EDGE, 
-                           markeredgewidth=2, linestyle='None'),
-                plt.Line2D([0], [0], color=COLOR_TRAJECTORY, 
-                           linewidth=8, alpha=0.65, label='Trajectory'),
+                plt.Line2D([0], [0], marker='o', color='w',
+                           markerfacecolor=COLOR_IMAGE_NODE, markersize=12,
+                           label='Image Node', markeredgecolor=COLOR_IMAGE_NODE_EDGE,
+                           markeredgewidth=1.5, linestyle='None'),
+                plt.Line2D([0], [0], color='#E74C3C', linewidth=3,
+                           alpha=0.75, label='Object Contour'),
+                plt.Line2D([0], [0], marker='o', color='w',
+                           markerfacecolor=COLOR_AGENT, markersize=12,
+                           label='Current Position', markeredgecolor=COLOR_AGENT_EDGE,
+                           markeredgewidth=1.5, linestyle='None'),
+                plt.Line2D([0], [0], color=COLOR_TRAJECTORY,
+                           linewidth=6, alpha=0.65, label='Trajectory'),
             ]
-            
+
             if target_object_id is not None:
                 legend_elements.append(
-                    plt.Line2D([0], [0], marker='o', color='w', 
-                               markerfacecolor=COLOR_TARGET, markersize=16, 
-                               label='Goal', markeredgecolor='white', 
-                               markeredgewidth=2.5, linestyle='None')
+                    plt.Line2D([0], [0], marker='o', color='w',
+                               markerfacecolor=COLOR_TARGET, markersize=14,
+                               label='Goal', markeredgecolor='white',
+                               markeredgewidth=2, linestyle='None')
                 )
-            
+
             legend = ax.legend(
                 handles=legend_elements,
                 loc='upper right',
-                fontsize=max(9, base_radius * 0.7),
+                fontsize=max(7, base_radius * 0.6),
                 framealpha=0.92,
                 fancybox=True,
                 shadow=False,
                 frameon=True,
                 edgecolor='#CCCCCC',
-                borderpad=0.8,
-                labelspacing=0.8,
-                handletextpad=0.6,
+                borderpad=0.6,
+                labelspacing=0.6,
+                handletextpad=0.5,
             )
-            legend.get_frame().set_linewidth(1.2)
+            legend.get_frame().set_linewidth(1.0)
 
         # ==================== 保存高清图像 ====================
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -787,27 +752,38 @@ class SceneGraphVisualizer:
         # ==================== 图像设置 ====================
         fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
         fig.patch.set_facecolor('white')
-        
+
+        # ── 自动裁剪：使有效房间区域占据图像 ≥80% ──────────────────────────
+        top_down_map, (crop_y0, _crop_y1, crop_x0, _crop_x1) = self._autocrop_topdown_map(
+            top_down_map, margin_ratio=0.04, target_fill_ratio=0.78
+        )
+        crop_offsets = (crop_y0, crop_x0)  # 用于后续坐标修正
+
         # 绘制底图
         ax.imshow(top_down_map, origin="upper", interpolation='nearest')  # 使用 nearest 保持清晰
         map_shape = top_down_map.shape[:2]
-        
-        # 动态计算节点大小
+
+        # 动态计算节点大小（裁剪后地图更紧凑，节点应更小）
         map_diag = np.sqrt(map_shape[0]**2 + map_shape[1]**2)
-        base_radius = max(8, min(15, map_diag / 100))
-        trajectory_width = base_radius * 0.8
-        
+        base_radius = max(5, min(11, map_diag / 120))
+        trajectory_width = max(1.5, base_radius * 0.55)
+
         # ==================== 收集所有节点位置用于防重叠 ====================
         all_node_positions = []  # [(id, px, py), ...]
-        
+
+        def _world_to_cropped_pixel(world_pos):
+            """将世界坐标转换到裁剪后图像的像素坐标。"""
+            raw_px, raw_py = self.world_to_pixel(world_pos, top_down_map.shape[:2])
+            return raw_px, raw_py
+
         # Snapshot 节点
         snapshot_pixels = {}
         if snapshot_positions is not None:
             for i, pos in enumerate(snapshot_positions):
-                px, py = self.world_to_pixel(pos, map_shape)
+                px, py = _world_to_cropped_pixel(pos)
                 snapshot_pixels[f"snap_{i}"] = (px, py)
                 all_node_positions.append((f"snap_{i}", px, py))
-        
+
         # 对象节点
         background_classes = {'wall', 'floor', 'ceiling', 'paneling', 'banner', 'misc', 'unknown'}
         object_pixels = {}
@@ -818,22 +794,22 @@ class SceneGraphVisualizer:
                 class_name = object_classes.get(obj_id, '') if object_classes else ''
                 if class_name.lower() in background_classes:
                     continue
-                px, py = self.world_to_pixel(pos, map_shape)
+                px, py = _world_to_cropped_pixel(pos)
                 object_pixels[f"obj_{obj_id}"] = (px, py)
                 all_node_positions.append((f"obj_{obj_id}", px, py))
-        
+
         # 目标节点
         target_pixel = None
         if target_object_id is not None and object_positions and target_object_id in object_positions:
             pos = object_positions[target_object_id]
-            px, py = self.world_to_pixel(pos, map_shape)
+            px, py = _world_to_cropped_pixel(pos)
             target_pixel = (px, py)
             all_node_positions.append(("target", px, py))
         
         # Agent 位置
         agent_pixel = None
         if agent_position is not None:
-            px, py = self.world_to_pixel(agent_position, map_shape)
+            px, py = _world_to_cropped_pixel(agent_position)
             agent_pixel = (px, py)
             all_node_positions.append(("agent", px, py))
         
@@ -857,7 +833,7 @@ class SceneGraphVisualizer:
         
         # ==================== Layer 1: 轨迹线 ====================
         if snapshot_positions is not None and len(snapshot_positions) > 1:
-            snap_pos_list = [snapshot_pixels.get(f"snap_{i}", self.world_to_pixel(snapshot_positions[i], map_shape)) 
+            snap_pos_list = [snapshot_pixels.get(f"snap_{i}", _world_to_cropped_pixel(snapshot_positions[i]))
                            for i in range(len(snapshot_positions))]
             snap_pos_arr = np.array(snap_pos_list)
             
@@ -919,51 +895,22 @@ class SceneGraphVisualizer:
                     )
                     ax.add_patch(circle)
 
-        # ==================== Layer 4: 对象节点 ====================
-        if object_positions:
-            for obj_id, pos in object_positions.items():
-                if target_object_id is not None and obj_id == target_object_id:
-                    continue
-                class_name = object_classes.get(obj_id, '') if object_classes else ''
-                if class_name.lower() in background_classes:
-                    continue
-                
-                obj_key = f"obj_{obj_id}"
-                if obj_key in object_pixels:
-                    px, py = object_pixels[obj_key]
-                    triangle_size = base_radius * 0.8
-                    triangle = plt.Polygon(
-                        [
-                            (px, py - triangle_size * 1.1),
-                            (px - triangle_size, py + triangle_size * 0.55),
-                            (px + triangle_size, py + triangle_size * 0.55),
-                        ],
-                        facecolor=COLOR_OBJECT_NODE,
-                        edgecolor=COLOR_OBJECT_NODE_EDGE,
-                        linewidth=1.5,
-                        alpha=0.85,
-                        zorder=15
-                    )
-                    ax.add_patch(triangle)
-                    
-                    if show_object_labels and class_name:
-                        ax.text(
-                            px, py + triangle_size * 1.8,
-                            class_name,
-                            fontsize=max(5, base_radius * 0.4),
-                            color='#2C3E50',
-                            fontweight='semibold',
-                            ha='center',
-                            va='top',
-                            bbox=dict(
-                                boxstyle='round,pad=0.1',
-                                facecolor='white',
-                                alpha=0.7,
-                                edgecolor='#BDC3C7',
-                                linewidth=0.5
-                            ),
-                            zorder=16
-                        )
+        # ==================== Layer 4: 对象节点（点云轮廓化显示）====================
+        # 使用 _draw_object_contours 绘制物体真实轮廓，替代矩形/三角形节点
+        # scene_objects 通过 exploration_masks 参数（复用）或 None 传入
+        _scene_objects_ref = exploration_masks.get('__scene_objects__', None) if isinstance(exploration_masks, dict) else None
+        self._draw_object_contours(
+            ax=ax,
+            object_positions=object_positions or {},
+            object_classes=object_classes,
+            scene_objects=_scene_objects_ref,
+            map_shape=map_shape,
+            crop_offsets=(0, 0),   # 已在 _world_to_cropped_pixel 中完成坐标转换
+            base_radius=base_radius,
+            target_object_id=target_object_id,
+            show_labels=show_object_labels,
+            background_classes=background_classes,
+        )
 
         # ==================== Layer 5: 目标节点（无光晕）====================
         if target_pixel is not None:
@@ -979,7 +926,7 @@ class SceneGraphVisualizer:
                 zorder=19
             )
             ax.add_patch(target_circle)
-            
+
             if object_classes and target_object_id in object_classes:
                 target_name = object_classes[target_object_id]
                 ax.text(
@@ -1036,57 +983,56 @@ class SceneGraphVisualizer:
         # ==================== 图例 ====================
         if show_legend:
             legend_elements = [
-                plt.Line2D([0], [0], marker='o', color='w', 
-                           markerfacecolor=COLOR_IMAGE_NODE, markersize=12, 
-                           label='Image Node', markeredgecolor=COLOR_IMAGE_NODE_EDGE, 
-                           markeredgewidth=1.5, linestyle='None'),
-                plt.Line2D([0], [0], marker='^', color='w', 
-                           markerfacecolor=COLOR_OBJECT_NODE, markersize=12, 
-                           label='Object Node', markeredgecolor=COLOR_OBJECT_NODE_EDGE, 
-                           markeredgewidth=1.5, linestyle='None'),
-                plt.Line2D([0], [0], marker='o', color='w', 
-                           markerfacecolor=COLOR_AGENT, markersize=12, 
-                           label='Current Position', markeredgecolor=COLOR_AGENT_EDGE, 
-                           markeredgewidth=1.5, linestyle='None'),
-                plt.Line2D([0], [0], color=COLOR_TRAJECTORY, 
-                           linewidth=6, alpha=0.6, label='Trajectory'),
+                plt.Line2D([0], [0], marker='o', color='w',
+                           markerfacecolor=COLOR_IMAGE_NODE, markersize=10,
+                           label='Image Node', markeredgecolor=COLOR_IMAGE_NODE_EDGE,
+                           markeredgewidth=1.2, linestyle='None'),
+                # 物体以轮廓线段表示（色板中任意颜色）
+                plt.Line2D([0], [0], color='#E74C3C', linewidth=3,
+                           alpha=0.75, label='Object Contour'),
+                plt.Line2D([0], [0], marker='o', color='w',
+                           markerfacecolor=COLOR_AGENT, markersize=10,
+                           label='Current Position', markeredgecolor=COLOR_AGENT_EDGE,
+                           markeredgewidth=1.2, linestyle='None'),
+                plt.Line2D([0], [0], color=COLOR_TRAJECTORY,
+                           linewidth=5, alpha=0.6, label='Trajectory'),
             ]
-            
+
             if target_object_id is not None:
                 legend_elements.append(
-                    plt.Line2D([0], [0], marker='o', color='w', 
-                               markerfacecolor=COLOR_TARGET, markersize=14, 
-                               label='Goal', markeredgecolor='white', 
-                               markeredgewidth=2, linestyle='None')
+                    plt.Line2D([0], [0], marker='o', color='w',
+                               markerfacecolor=COLOR_TARGET, markersize=12,
+                               label='Goal', markeredgecolor='white',
+                               markeredgewidth=1.5, linestyle='None')
                 )
-            
+
             # 探索状态图例
             if show_exploration_legend:
                 legend_elements.extend([
-                    plt.Line2D([0], [0], marker='s', color='w', 
-                               markerfacecolor=COLOR_EXPLORED, markersize=12, 
-                               label='Explored', markeredgecolor='#282828', 
+                    plt.Line2D([0], [0], marker='s', color='w',
+                               markerfacecolor=COLOR_EXPLORED, markersize=10,
+                               label='Explored', markeredgecolor='#282828',
                                markeredgewidth=1, linestyle='None'),
-                    plt.Line2D([0], [0], marker='s', color='w', 
-                               markerfacecolor=COLOR_OBSERVED, markersize=12, 
-                               label='Observed', markeredgecolor='#969696', 
+                    plt.Line2D([0], [0], marker='s', color='w',
+                               markerfacecolor=COLOR_OBSERVED, markersize=10,
+                               label='Observed', markeredgecolor='#969696',
                                markeredgewidth=1, linestyle='None'),
-                    plt.Line2D([0], [0], marker='s', color='w', 
-                               markerfacecolor=COLOR_UNEXPLORED, markersize=12, 
-                               label='Unexplored', markeredgecolor='#A0A0A0', 
+                    plt.Line2D([0], [0], marker='s', color='w',
+                               markerfacecolor=COLOR_UNEXPLORED, markersize=10,
+                               label='Unexplored', markeredgecolor='#A0A0A0',
                                markeredgewidth=1, linestyle='None'),
                 ])
-            
+
             legend = ax.legend(
                 handles=legend_elements,
                 loc='upper right',
-                fontsize=max(8, base_radius * 0.6),
+                fontsize=max(7, base_radius * 0.55),
                 framealpha=0.9,
                 fancybox=True,
                 frameon=True,
                 edgecolor='#CCCCCC',
-                borderpad=0.6,
-                labelspacing=0.6,
+                borderpad=0.5,
+                labelspacing=0.5,
             )
             legend.get_frame().set_linewidth(1.0)
 
@@ -1507,6 +1453,223 @@ class SceneGraphVisualizer:
 
     # ==================== 辅助方法 ====================
 
+    @staticmethod
+    def _autocrop_topdown_map(
+        img: np.ndarray,
+        margin_ratio: float = 0.05,
+        bg_color_thresh: int = 240,
+        target_fill_ratio: float = 0.80,
+    ) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        """自动裁剪俯视图，使有效房间区域占据图像 ~80% 以上。
+
+        算法：
+        1. 将接近白色（≥bg_color_thresh 的全通道）的像素视为背景。
+        2. 找到所有非背景像素的 bounding box。
+        3. 在四边各留 margin_ratio 比例的余量后裁剪。
+
+        Args:
+            img: RGB (H, W, 3) uint8 图像。
+            margin_ratio: 裁剪框四周留白比例（相对内容区域宽/高）。
+            bg_color_thresh: 亮度阈值，高于该值视为背景。
+            target_fill_ratio: 目标有效填充率（若内容已足够大则不裁剪）。
+
+        Returns:
+            (cropped_img, (y0, y1, x0, x1)) 裁剪后图像及像素范围。
+        """
+        if img is None or img.size == 0:
+            return img, (0, img.shape[0] if img is not None else 0,
+                         0, img.shape[1] if img is not None else 0)
+        try:
+            # 背景掩码：三通道均 >= 阈值
+            bg_mask = np.all(img >= bg_color_thresh, axis=2)
+            content_mask = ~bg_mask
+
+            # 如果几乎没有非背景内容，直接返回原图
+            if content_mask.sum() < 100:
+                return img, (0, img.shape[0], 0, img.shape[1])
+
+            # 内容区域 bounding box
+            rows = np.any(content_mask, axis=1)
+            cols = np.any(content_mask, axis=0)
+            r0, r1 = np.where(rows)[0][[0, -1]]
+            c0, c1 = np.where(cols)[0][[0, -1]]
+
+            h_content = r1 - r0
+            w_content = c1 - c0
+            H, W = img.shape[:2]
+
+            # 如果内容已占满足目标比例，不裁剪
+            if (h_content / H) >= target_fill_ratio and (w_content / W) >= target_fill_ratio:
+                return img, (0, H, 0, W)
+
+            # 加 margin
+            margin_r = max(8, int(h_content * margin_ratio))
+            margin_c = max(8, int(w_content * margin_ratio))
+
+            y0 = max(0, r0 - margin_r)
+            y1 = min(H, r1 + margin_r)
+            x0 = max(0, c0 - margin_c)
+            x1 = min(W, c1 + margin_c)
+
+            return img[y0:y1, x0:x1], (y0, y1, x0, x1)
+        except Exception:
+            return img, (0, img.shape[0], 0, img.shape[1])
+
+    def _draw_object_contours(
+        self,
+        ax,
+        object_positions: Dict[int, np.ndarray],
+        object_classes: Optional[Dict[int, str]],
+        scene_objects: Optional[Dict[int, Dict[str, Any]]],
+        map_shape: Tuple[int, int],
+        crop_offsets: Tuple[int, int],
+        base_radius: float,
+        target_object_id: Optional[int] = None,
+        show_labels: bool = False,
+        background_classes: Optional[set] = None,
+    ) -> None:
+        """使用点云投影轮廓替代矩形 BBox 绘制物体轮廓。
+
+        算法：
+        1. 从 scene_objects[obj_id]['pcd'].points 提取点云，投影到 XZ 平面。
+        2. 转换到像素坐标后，使用 cv2.convexHull 求轮廓。
+        3. 用物体分配颜色绘制填充轮廓 + 边缘线。
+        4. 若点云不可用，回退到小圆点显示。
+
+        Args:
+            ax: matplotlib Axes 对象。
+            object_positions: {obj_id: (3,)} 物体位置（用于颜色/标签）。
+            object_classes: {obj_id: class_name}。
+            scene_objects: 完整物体字典，提供 pcd 数据。
+            map_shape: (H, W) 底图形状（裁剪后）。
+            crop_offsets: (y0, x0) 裁剪偏移量，用于修正像素坐标。
+            base_radius: 基础节点半径（用于回退圆点大小）。
+            target_object_id: 目标物体 ID（跳过，由调用方单独处理）。
+            show_labels: 是否显示类别标签。
+            background_classes: 需要过滤的背景类集合。
+        """
+        try:
+            import cv2
+            has_cv2 = True
+        except ImportError:
+            has_cv2 = False
+
+        if background_classes is None:
+            background_classes = {'wall', 'floor', 'ceiling', 'paneling', 'banner', 'misc', 'unknown'}
+
+        # 预定义物体颜色色板（按类名哈希取色，保证相同类颜色一致）
+        _PALETTE = [
+            '#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6',
+            '#1ABC9C', '#E67E22', '#2980B9', '#27AE60', '#8E44AD',
+            '#D35400', '#16A085', '#C0392B', '#2471A3', '#1E8449',
+        ]
+
+        def _class_color(class_name: str) -> str:
+            idx = hash(class_name) % len(_PALETTE)
+            return _PALETTE[idx]
+
+        y0_off, x0_off = crop_offsets
+
+        for obj_id, world_pos in object_positions.items():
+            if target_object_id is not None and obj_id == target_object_id:
+                continue
+            class_name = object_classes.get(obj_id, '') if object_classes else ''
+            if class_name.lower() in background_classes:
+                continue
+
+            color = _class_color(class_name)
+
+            # 尝试从 pcd 提取点云轮廓
+            drawn_contour = False
+            if has_cv2 and scene_objects is not None:
+                obj_data = scene_objects.get(obj_id, {})
+                pcd = obj_data.get('pcd', None)
+                if pcd is not None and hasattr(pcd, 'points'):
+                    try:
+                        pts_3d = np.asarray(pcd.points)
+                        if len(pts_3d) >= 4:
+                            # 投影到 XZ 平面 → 像素坐标（考虑裁剪偏移）
+                            px_arr = []
+                            for p in pts_3d:
+                                raw = self.world_to_pixel(p, map_shape)
+                                # 修正裁剪偏移
+                                px_arr.append([raw[0] - x0_off, raw[1] - y0_off])
+                            px_arr = np.array(px_arr, dtype=np.float32)
+
+                            # 过滤超出图像范围的点
+                            H, W = map_shape
+                            valid = (
+                                (px_arr[:, 0] >= 0) & (px_arr[:, 0] < W - x0_off) &
+                                (px_arr[:, 1] >= 0) & (px_arr[:, 1] < H - y0_off)
+                            )
+                            px_arr = px_arr[valid]
+                            if len(px_arr) >= 4:
+                                hull = cv2.convexHull(px_arr.astype(np.int32))
+                                hull_pts = hull.squeeze()
+                                if hull_pts.ndim == 2 and len(hull_pts) >= 3:
+                                    # 解析颜色为 RGBA
+                                    import matplotlib.colors as mcolors
+                                    rgba = mcolors.to_rgba(color, alpha=0.45)
+                                    edge_rgba = mcolors.to_rgba(color, alpha=0.85)
+                                    poly = plt.Polygon(
+                                        hull_pts,
+                                        facecolor=rgba,
+                                        edgecolor=edge_rgba,
+                                        linewidth=1.2,
+                                        zorder=14,
+                                    )
+                                    ax.add_patch(poly)
+                                    drawn_contour = True
+
+                                    if show_labels and class_name:
+                                        cx = hull_pts[:, 0].mean()
+                                        cy = hull_pts[:, 1].mean()
+                                        ax.text(
+                                            cx, cy, class_name[:8],
+                                            fontsize=max(4, base_radius * 0.35),
+                                            color='#1C1C1C',
+                                            fontweight='semibold',
+                                            ha='center', va='center',
+                                            bbox=dict(
+                                                boxstyle='round,pad=0.08',
+                                                facecolor='white',
+                                                alpha=0.65,
+                                                edgecolor='none',
+                                            ),
+                                            zorder=15,
+                                        )
+                    except Exception as _e:
+                        self.logger.debug(f"Contour draw failed for obj {obj_id}: {_e}")
+
+            # 回退：绘制小圆点
+            if not drawn_contour:
+                px, py = self.world_to_pixel(world_pos, map_shape)
+                px -= x0_off
+                py -= y0_off
+                dot = plt.Circle(
+                    (px, py),
+                    radius=max(3, base_radius * 0.45),
+                    facecolor=color,
+                    edgecolor='#333333',
+                    linewidth=0.8,
+                    alpha=0.80,
+                    zorder=14,
+                )
+                ax.add_patch(dot)
+                if show_labels and class_name:
+                    ax.text(
+                        px, py - base_radius * 0.8, class_name[:8],
+                        fontsize=max(4, base_radius * 0.35),
+                        color='#1C1C1C',
+                        ha='center', va='top',
+                        bbox=dict(
+                            boxstyle='round,pad=0.08',
+                            facecolor='white', alpha=0.65,
+                            edgecolor='none',
+                        ),
+                        zorder=15,
+                    )
+
     def _compute_room_centroids_2d(
         self, regions: Dict[int, Any], floor_id: str
     ) -> Dict[str, np.ndarray]:
@@ -1570,6 +1733,30 @@ class SceneGraphVisualizer:
                 return None
 
         return None
+
+    def _get_object_style(
+        self,
+        obj_id: int,
+        decision_history: Optional[Dict[int, List[str]]],
+    ) -> Tuple[str, str]:
+        """Return (color, marker) for an object node based on its decision history.
+
+        Colors:
+            - No history / MERGE : gray  ('o')
+            - KEEP               : yellow ('^')
+            - REPLACE            : orange ('s')
+            - SPLIT              : red    ('D')
+        """
+        if decision_history is None or obj_id not in decision_history:
+            return ('#888888', 'o')
+        decisions = decision_history[obj_id]
+        if 'SPLIT' in decisions:
+            return ('#E74C3C', 'D')
+        if 'REPLACE' in decisions:
+            return ('#F39C12', 's')
+        if 'KEEP' in decisions:
+            return ('#F1C40F', '^')
+        return ('#95A5A6', 'o')
 
     def _add_legend(self, ax) -> None:
         """
