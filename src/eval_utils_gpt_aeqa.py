@@ -89,8 +89,18 @@ def format_question(step):
 
 
 def get_step_info(step, verbose=False):
+    """Extract and prepare step information for VLM prompting.
+
+    Returns:
+        question, image_goal, egocentric_imgs, frontier_imgs,
+        snapshot_imgs, snapshot_classes, keep_index, snapshot_room_ids,
+        room_exploration_status, snapshot_room_labels
+    """
     # 1 get question data
     question, image_goal = format_question(step)
+
+    # 1.5 get room exploration status (may be None)
+    room_exploration_status = step.get("room_exploration_status", None)
 
     # 2 get step information(egocentric, frontier, snapshot)
     # 2.1 get egocentric views
@@ -106,8 +116,12 @@ def get_step_info(step, verbose=False):
 
     # 2.3 get snapshots
     snapshot_imgs, snapshot_classes = [], []
+    snapshot_room_ids = []
+    snapshot_room_labels = []
     obj_map = step["obj_map"]
     seen_classes = set()
+    raw_room_ids = step.get("snapshot_room_ids", {})
+    raw_room_labels = step.get("snapshot_room_labels", {})
     for i, rgb_id in enumerate(step["snapshot_imgs"].keys()):
         snapshot_img = step["snapshot_imgs"][rgb_id]
         snapshot_imgs.append(encode_tensor2base64(snapshot_img))
@@ -116,6 +130,8 @@ def get_step_info(step, verbose=False):
         snapshot_class = sorted(list(set(snapshot_class)))
         seen_classes.update(snapshot_class)
         snapshot_classes.append(snapshot_class)
+        snapshot_room_ids.append(raw_room_ids.get(rgb_id))
+        snapshot_room_labels.append(raw_room_labels.get(rgb_id))
 
     # 3 prefiltering, note that we need the obj_id_mapping
     keep_index = list(range(len(snapshot_imgs)))
@@ -130,6 +146,8 @@ def get_step_info(step, verbose=False):
             verbose,
         )
         snapshot_imgs = [snapshot_imgs[i] for i in keep_index]
+        snapshot_room_ids = [snapshot_room_ids[i] for i in keep_index]
+        snapshot_room_labels = [snapshot_room_labels[i] for i in keep_index]
         if verbose:
             logging.info(
                 f"Prefiltering snapshot: {n_prev_snapshot} -> {len(snapshot_imgs)}"
@@ -143,6 +161,9 @@ def get_step_info(step, verbose=False):
         snapshot_imgs,
         snapshot_classes,
         keep_index,
+        snapshot_room_ids,
+        room_exploration_status,
+        snapshot_room_labels,
     )
 
 
@@ -155,7 +176,17 @@ def format_explore_prompt(
     egocentric_view=False,
     use_snapshot_class=True,
     image_goal=None,
+    snapshot_room_ids=None,
+    room_exploration_status=None,
+    snapshot_room_labels=None,
 ):
+    """Build the system prompt and content list for the VLM.
+
+    Args:
+        snapshot_room_ids: list of Optional[int], region IDs per snapshot (legacy, kept for compat).
+        room_exploration_status: str or None, global room exploration summary.
+        snapshot_room_labels: list of Optional[str], human-readable room labels per snapshot.
+    """
     sys_prompt = "Task: You are an agent in an indoor scene tasked with answering questions by observing the surroundings and exploring the environment. To answer the question, you are required to choose either a Snapshot as the answer or a Frontier to further explore.\n"
     sys_prompt += "Definitions:\n"
     sys_prompt += "Snapshot: A focused observation of several objects. Choosing a Snapshot means that this snapshot image contains enough information for you to answer the question. "
@@ -175,6 +206,12 @@ def format_explore_prompt(
     text = "Select the Frontier/Snapshot that would help find the answer of the question.\n"
     content.append((text,))
 
+    # 1.5 insert global room exploration status if available
+    if room_exploration_status:
+        text = f"Exploration Status:\n{room_exploration_status}\n"
+        text += "Consider exploring rooms that are Unexplored or Partially explored if current snapshots don't contain the answer.\n"
+        content.append((text,))
+
     # 2 add egocentric view
     if egocentric_view:
         text = (
@@ -192,7 +229,20 @@ def format_explore_prompt(
         content.append(("No Snapshot is available\n",))
     else:
         for i in range(len(snapshot_imgs)):
-            content.append((f"Snapshot {i} ", snapshot_imgs[i]))
+            # Build snapshot label with optional room info
+            # Prefer human-readable label, fall back to numeric room_id
+            room_label = None
+            if snapshot_room_labels is not None and i < len(snapshot_room_labels):
+                room_label = snapshot_room_labels[i]
+            if room_label is None and snapshot_room_ids is not None and i < len(snapshot_room_ids):
+                rid = snapshot_room_ids[i]
+                if rid is not None:
+                    room_label = f"Room {rid}"
+            if room_label is not None:
+                label = f"Snapshot {i} (Room: {room_label}) "
+            else:
+                label = f"Snapshot {i} "
+            content.append((label, snapshot_imgs[i]))
             if use_snapshot_class:
                 text = ", ".join(snapshot_classes[i])
                 content.append((text,))
@@ -312,6 +362,9 @@ def explore_step(step, cfg, verbose=False):
         snapshot_imgs,
         snapshot_classes,
         snapshot_id_mapping,
+        snapshot_room_ids,
+        room_exploration_status,
+        snapshot_room_labels,
     ) = get_step_info(step, verbose)
     sys_prompt, content = format_explore_prompt(
         question,
@@ -322,6 +375,9 @@ def explore_step(step, cfg, verbose=False):
         egocentric_view=step.get("use_egocentric_views", False),
         use_snapshot_class=True,
         image_goal=image_goal,
+        snapshot_room_ids=snapshot_room_ids,
+        room_exploration_status=room_exploration_status,
+        snapshot_room_labels=snapshot_room_labels,
     )
 
     if verbose:
