@@ -196,43 +196,78 @@ class Scene:
         self.frames = {}
         self.all_observations = {}
 
-    def update_snapshot_rooms(self, obj_to_region: dict):
-        """Assign room_id and room_name to each snapshot by majority vote over its cluster's region mapping.
+    def update_snapshot_rooms(self, obj_to_region: dict, agent_pts: Optional[np.ndarray] = None):
+        """Assign room_id and room_name to each snapshot via distance-weighted voting.
+
+        Uses object-to-agent distance to weight each object's region vote.
+        Weight formula: w = max(0, 1 - d / 5.0), so nearby objects have higher influence.
+        Falls back to equal-weight voting when agent_pts is unavailable.
 
         Also registers each snapshot with its room in the builder (if available)
-        and attempts to infer a human-readable room name via the builder.
+        and attempts to infer/refresh a human-readable room name.
 
         Args:
             obj_to_region: dict mapping object_id (int) -> region_id (int),
-                           typically from ExplicitMemoryGraphBuilder.obj_to_region.
+                           from ExplicitMemoryGraphBuilder.obj_to_region.
+            agent_pts: (3,) habitat coordinate of agent, used for distance weighting.
         """
-        for snapshot in self.snapshots.values():
-            region_ids = [
-                obj_to_region[obj_id]
-                for obj_id in snapshot.cluster
-                if obj_id in obj_to_region
-            ]
-            if region_ids:
-                snapshot.room_id = Counter(region_ids).most_common(1)[0][0]
-            else:
+        for snap_idx, snapshot in enumerate(self.snapshots.values()):
+            if not snapshot.cluster:
                 snapshot.room_id = None
-                snapshot.room_name = None
+                snapshot.room_name = "unknown area"
                 continue
+
+            # Distance-weighted vote: region_id -> accumulated weight
+            weighted_scores: dict = {}
+            has_any_region = False
+
+            for obj_id in snapshot.cluster:
+                rid = obj_to_region.get(obj_id)
+                if rid is None:
+                    continue
+                has_any_region = True
+
+                # Compute distance weight
+                weight = 1.0
+                if agent_pts is not None:
+                    obj = self.objects.get(obj_id, {})
+                    bbox = obj.get("bbox", None)
+                    if bbox is not None and hasattr(bbox, "center"):
+                        center = np.asarray(bbox.center)
+                        dist = float(np.linalg.norm(center[[0, 2]] - np.asarray(agent_pts)[[0, 2]]))
+                        weight = max(0.0, 1.0 - dist / 5.0)
+
+                weighted_scores[rid] = weighted_scores.get(rid, 0.0) + weight
+
+            if not has_any_region:
+                snapshot.room_id = None
+                snapshot.room_name = "unknown area"
+                continue
+
+            # Pick highest-scoring region
+            best_room_id = max(weighted_scores, key=weighted_scores.get)
+            snapshot.room_id = best_room_id
 
             # Try to get/infer room name via builder
             if self.builder is not None:
                 try:
                     name = self.builder.get_room_name(snapshot.room_id, scene_objects=self.objects)
-                    snapshot.room_name = name
+                    # get_room_name always returns non-None (falls back to "Room_<id>")
+                    snapshot.room_name = name if name is not None else f"Room_{snapshot.room_id}"
                 except Exception:
-                    snapshot.room_name = None
+                    snapshot.room_name = f"Room_{snapshot.room_id}"
                 # Register snapshot → room association
                 try:
                     self.builder.add_snapshot_to_room(snapshot.image, snapshot.room_id)
                 except Exception:
                     pass
             else:
-                snapshot.room_name = None
+                snapshot.room_name = f"Room_{snapshot.room_id}"
+
+            logging.info(
+                f"Snapshot {snap_idx} assigned to '{snapshot.room_name}' "
+                f"(Room {snapshot.room_id}) via distance-weighted voting."
+            )
 
     def get_observation(self, pts, angle):
         agent_state = habitat_sim.AgentState()
