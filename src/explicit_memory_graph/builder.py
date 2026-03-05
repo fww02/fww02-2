@@ -60,13 +60,18 @@ class RegionNode:
     mask: Optional[np.ndarray] = None
     # list of object ids assigned to this region
     objects: List[int] = field(default_factory=list)
+    # inferred human-readable room name (e.g. "kitchen"), None until inferred
+    name: Optional[str] = None
+    # snapshot image filenames associated with this region
+    snapshots: List[str] = field(default_factory=list)
 
     def to_json(self) -> Dict[str, Any]:
         return {
             "room_id": f"{self.floor_id}_{self.region_id}",
-            "name": None,
+            "name": self.name,
             "floor_id": self.floor_id,
             "objects": self.objects,
+            "snapshots": list(self.snapshots),
             "created_step": self.created_step,
             "last_seen_step": self.last_seen_step,
             # vertices/pcd fields are intentionally omitted in the online lightweight mode
@@ -117,12 +122,174 @@ class ExplicitMemoryGraphBuilder:
         # object_id -> region_id
         self._obj_to_region: Dict[int, int] = {}
 
+        # region_id -> list of object_ids (reverse index, kept in sync with _obj_to_region)
+        self._region_to_objs: Dict[int, List[int]] = {}
+
+        # room naming control
+        self.enable_room_naming: bool = True  # can be toggled off externally
+
         # metadata
         self._created = False
         self._episode_info: Dict[str, Any] = {}
 
         # trajectory recording for video generation
         self._trajectory_voxels: List[np.ndarray] = []
+
+    @property
+    def obj_to_region(self) -> Dict[int, int]:
+        """Return a copy of the object-to-region mapping (object_id -> region_id)."""
+        return dict(self._obj_to_region)
+
+    # ── Room naming & exploration status ────────────────────────────────
+
+    def _infer_room_name(self, room_id: int, scene_objects: Dict[int, Dict[str, Any]]) -> Optional[str]:
+        """Infer a human-readable room name from the objects assigned to a region.
+
+        Uses the LLM (call_openai_api) to classify the room type based on object classes.
+        Only called when the region has >= 2 objects and has not been named yet.
+        Returns None on failure (never blocks the main loop).
+        """
+        obj_ids = self._region_to_objs.get(room_id, [])
+        if len(obj_ids) < 2:
+            return None
+
+        # Collect unique class names
+        class_names = set()
+        for oid in obj_ids:
+            obj = scene_objects.get(oid, {})
+            cn = obj.get("class_name", None)
+            if cn:
+                class_names.add(cn)
+        if not class_names:
+            return None
+
+        try:
+            from src.eval_utils_gpt_aeqa import call_openai_api
+            objects_str = ", ".join(sorted(class_names))
+            sys_prompt = "You are a room classifier."
+            content = [(
+                f"Based on the objects [{objects_str}], determine the room type from: "
+                "bedroom, living room, kitchen, bathroom, dining room, office, hallway, closet, laundry room, garage, other. "
+                "Reply with ONLY the room type name, nothing else. Room type:",
+            )]
+            response = call_openai_api(sys_prompt, content)
+            if response is not None:
+                name = response.strip().lower()
+                # Validate against known types
+                valid_types = {
+                    "bedroom", "living room", "kitchen", "bathroom",
+                    "dining room", "office", "hallway", "closet",
+                    "laundry room", "garage", "other",
+                }
+                if name in valid_types:
+                    return name
+                # Try fuzzy match: pick the first valid type that is a substring
+                for vt in valid_types:
+                    if vt in name:
+                        return vt
+                return name  # return raw response as best-effort
+        except Exception as e:
+            import logging
+            logging.debug(f"Room name inference failed for room {room_id}: {e}")
+        return None
+
+    def get_room_name(self, room_id: int, scene_objects: Optional[Dict[int, Dict[str, Any]]] = None) -> Optional[str]:
+        """Return the room name for a given region_id.
+
+        If the room has not been named yet and enable_room_naming is True,
+        tries to infer the name via LLM. Falls back to None on failure.
+        """
+        rn = self._regions.get(room_id)
+        if rn is None:
+            return None
+        if rn.name is not None:
+            return rn.name
+        if not self.enable_room_naming:
+            return None
+        if scene_objects is None:
+            return None
+        # Attempt inference
+        inferred = self._infer_room_name(room_id, scene_objects)
+        if inferred is not None:
+            rn.name = inferred
+        return rn.name
+
+    def add_snapshot_to_room(self, snapshot_image: str, room_id: int) -> None:
+        """Associate a snapshot filename with a region (room)."""
+        rn = self._regions.get(room_id)
+        if rn is None:
+            return
+        if snapshot_image not in rn.snapshots:
+            rn.snapshots.append(snapshot_image)
+
+    def get_room_exploration_status(self) -> str:
+        """Generate a human-readable summary of exploration status per room.
+
+        Returns a multi-line string like:
+            Room 0 (kitchen): Well explored (5 snapshots)
+            Room 1: Partially explored (2 snapshots)
+            Room 2: Unexplored (0 snapshots)
+        """
+        lines = []
+        for rid in sorted(self._regions.keys()):
+            rn = self._regions[rid]
+            n_snap = len(rn.snapshots)
+            if n_snap == 0:
+                status = "Unexplored"
+            elif n_snap <= 2:
+                status = "Partially explored"
+            else:
+                status = "Well explored"
+            if rn.name:
+                lines.append(f"Room {rid} ({rn.name}): {status} ({n_snap} snapshots)")
+            else:
+                lines.append(f"Room {rid}: {status} ({n_snap} snapshots)")
+        if not lines:
+            return "No rooms discovered yet."
+        return "\n".join(lines)
+
+    def handle_room_merge(self, old_id: int, new_id: int,
+                          scene_snapshots: Optional[Dict[str, Any]] = None) -> None:
+        """Merge old_id room into new_id room.
+
+        Migrates snapshots, objects, and updates _obj_to_region.
+        Optionally updates scene snapshot references if provided.
+        """
+        old_rn = self._regions.get(old_id)
+        new_rn = self._regions.get(new_id)
+        if old_rn is None or new_rn is None:
+            return
+
+        # Migrate snapshots
+        for sname in old_rn.snapshots:
+            if sname not in new_rn.snapshots:
+                new_rn.snapshots.append(sname)
+        old_rn.snapshots.clear()
+
+        # Migrate objects
+        for oid in list(old_rn.objects):
+            if oid not in new_rn.objects:
+                new_rn.objects.append(oid)
+            self._obj_to_region[oid] = new_id
+        old_rn.objects.clear()
+
+        # Sync reverse index
+        old_objs = self._region_to_objs.pop(old_id, [])
+        self._region_to_objs.setdefault(new_id, [])
+        for oid in old_objs:
+            if oid not in self._region_to_objs[new_id]:
+                self._region_to_objs[new_id].append(oid)
+
+        # Propagate new room name to merged region if new has no name yet
+        if new_rn.name is None and old_rn.name is not None:
+            new_rn.name = old_rn.name
+
+        # Update scene snapshot references if provided
+        if scene_snapshots is not None:
+            for _sname, snap in scene_snapshots.items():
+                if getattr(snap, "room_id", None) == old_id:
+                    snap.room_id = new_id
+                    snap.room_name = new_rn.name
 
     def _label_free_space_regions(self, unoccupied: Optional[np.ndarray]) -> List[np.ndarray]:
         """Return a list of connected free-space component masks.
@@ -288,9 +455,16 @@ class ExplicitMemoryGraphBuilder:
                     # allow reassignment only if it was never finalized; keep latest
                     if obj_id in self._regions[prev].objects:
                         self._regions[prev].objects.remove(obj_id)
+                    # sync reverse index
+                    if prev in self._region_to_objs and obj_id in self._region_to_objs[prev]:
+                        self._region_to_objs[prev].remove(obj_id)
                 self._obj_to_region[obj_id] = cur_region_id
                 if obj_id not in self._regions[cur_region_id].objects:
                     self._regions[cur_region_id].objects.append(obj_id)
+                # sync reverse index
+                self._region_to_objs.setdefault(cur_region_id, [])
+                if obj_id not in self._region_to_objs[cur_region_id]:
+                    self._region_to_objs[cur_region_id].append(obj_id)
 
     def _compute_dynamic_map_bounds(
         self, scene_objects: Dict[int, Dict[str, Any]]
