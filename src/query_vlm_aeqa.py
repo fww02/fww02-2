@@ -17,6 +17,15 @@ def query_vlm_for_response(
     # prepare input for vlm
     step_dict = {}
 
+    # prepare room exploration status from builder (if available)
+    if hasattr(scene, 'builder') and scene.builder is not None and hasattr(scene.builder, 'get_room_exploration_status'):
+        try:
+            step_dict["room_exploration_status"] = scene.builder.get_room_exploration_status()
+        except Exception:
+            step_dict["room_exploration_status"] = None
+    else:
+        step_dict["room_exploration_status"] = None
+
     # prepare snapshots
     object_id_to_name = {
         obj_id: obj["class_name"] for obj_id, obj in scene.objects.items()
@@ -25,9 +34,19 @@ def query_vlm_for_response(
 
     step_dict["snapshot_objects"] = {}
     step_dict["snapshot_imgs"] = {}
+    step_dict["snapshot_room_ids"] = {}
+    step_dict["snapshot_room_labels"] = {}
     for rgb_id, snapshot in scene.snapshots.items():
         step_dict["snapshot_objects"][rgb_id] = snapshot.cluster
         step_dict["snapshot_imgs"][rgb_id] = scene.all_observations[rgb_id]
+        step_dict["snapshot_room_ids"][rgb_id] = snapshot.room_id
+        # Prefer human-readable room_name, fallback to "Room <id>" or None
+        if snapshot.room_name is not None:
+            step_dict["snapshot_room_labels"][rgb_id] = snapshot.room_name
+        elif snapshot.room_id is not None:
+            step_dict["snapshot_room_labels"][rgb_id] = f"Room {snapshot.room_id}"
+        else:
+            step_dict["snapshot_room_labels"][rgb_id] = None
 
     # prepare frontier
     step_dict["frontier_imgs"] = [
