@@ -137,13 +137,13 @@ class ExplicitMemoryGraphBuilder:
         # Semantic drift detection config (can be overridden via configure_drift_detection)
         self.drift_threshold: int = 2
         self.indicator_conf_threshold: float = 0.5
-        # Default indicator map; use configure_drift_detection() to load from cfg
+        # Default indicator map — only scene-exclusive objects kept to prevent false positives.
+        # Generic objects (chair, table, lamp, plant, picture, etc.) are intentionally omitted.
         self._indicator_map: Dict[str, List[str]] = {
-            "living_room": ["sofa", "couch", "coffee table", "television", "tv", "fireplace", "end table", "armchair"],
-            "kitchen": ["refrigerator", "stove", "oven", "microwave", "sink", "dishwasher", "cabinet", "blender", "toaster"],
-            "bedroom": ["bed", "wardrobe", "nightstand", "dresser", "pillow", "blanket"],
-            "bathroom": ["toilet", "shower", "bathtub", "bathroom sink", "towel rack", "mirror"],
-            "dining_room": ["dining table", "chair", "chandelier"],
+            "living_room": ["sofa", "couch", "television", "tv", "fireplace"],
+            "kitchen": ["refrigerator", "stove", "oven", "microwave", "dishwasher"],
+            "bedroom": ["bed", "wardrobe"],
+            "bathroom": ["toilet", "shower", "bathtub"],
         }
         # Build reverse: class_name -> room_type (first match wins)
         self._class_to_room_type: Dict[str, str] = {}
