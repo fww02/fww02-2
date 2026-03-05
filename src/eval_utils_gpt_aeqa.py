@@ -229,22 +229,26 @@ def format_explore_prompt(
         content.append(("No Snapshot is available\n",))
     else:
         for i in range(len(snapshot_imgs)):
-            # Build snapshot label with optional room info
-            # Prefer human-readable label, fall back to numeric room_id
+            # Build snapshot label: prefer human-readable label, fall back to room_id, then omit
             room_label = None
             if snapshot_room_labels is not None and i < len(snapshot_room_labels):
                 room_label = snapshot_room_labels[i]
-            if room_label is None and snapshot_room_ids is not None and i < len(snapshot_room_ids):
+            # Secondary fallback: raw numeric room_id
+            if (room_label is None or room_label == "") and snapshot_room_ids is not None and i < len(snapshot_room_ids):
                 rid = snapshot_room_ids[i]
                 if rid is not None:
-                    room_label = f"Room {rid}"
+                    room_label = f"Room_{rid}"
+            # Safe string formatting — guard against non-string values
             if room_label is not None:
-                label = f"Snapshot {i} (Room: {room_label}) "
+                room_label_str = str(room_label)
+                label = f"Snapshot {i} (Room: {room_label_str}) "
             else:
                 label = f"Snapshot {i} "
             content.append((label, snapshot_imgs[i]))
             if use_snapshot_class:
-                text = ", ".join(snapshot_classes[i])
+                # safe join: filter out any non-string class names
+                safe_classes = [str(c) for c in snapshot_classes[i] if c is not None]
+                text = ", ".join(safe_classes)
                 content.append((text,))
             content.append(("\n",))
 
