@@ -64,6 +64,8 @@ class RegionNode:
     name: Optional[str] = None
     # snapshot image filenames associated with this region
     snapshots: List[str] = field(default_factory=list)
+    # incremented every time the name changes (for cache invalidation)
+    semantic_version: int = 0
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -74,6 +76,7 @@ class RegionNode:
             "snapshots": list(self.snapshots),
             "created_step": self.created_step,
             "last_seen_step": self.last_seen_step,
+            "semantic_version": self.semantic_version,
             # vertices/pcd fields are intentionally omitted in the online lightweight mode
         }
 
@@ -128,6 +131,24 @@ class ExplicitMemoryGraphBuilder:
         # room naming control
         self.enable_room_naming: bool = True  # can be toggled off externally
 
+        # inference lock: set of room_ids currently being inferred (prevents duplicate LLM calls)
+        self._inferring: set = set()
+
+        # Semantic drift detection config (can be overridden via configure_drift_detection)
+        self.drift_threshold: int = 2
+        self.indicator_conf_threshold: float = 0.5
+        # Default indicator map; use configure_drift_detection() to load from cfg
+        self._indicator_map: Dict[str, List[str]] = {
+            "living_room": ["sofa", "couch", "coffee table", "television", "tv", "fireplace", "end table", "armchair"],
+            "kitchen": ["refrigerator", "stove", "oven", "microwave", "sink", "dishwasher", "cabinet", "blender", "toaster"],
+            "bedroom": ["bed", "wardrobe", "nightstand", "dresser", "pillow", "blanket"],
+            "bathroom": ["toilet", "shower", "bathtub", "bathroom sink", "towel rack", "mirror"],
+            "dining_room": ["dining table", "chair", "chandelier"],
+        }
+        # Build reverse: class_name -> room_type (first match wins)
+        self._class_to_room_type: Dict[str, str] = {}
+        self._rebuild_class_to_room_type()
+
         # metadata
         self._created = False
         self._episode_info: Dict[str, Any] = {}
@@ -142,77 +163,166 @@ class ExplicitMemoryGraphBuilder:
 
     # ── Room naming & exploration status ────────────────────────────────
 
-    def _infer_room_name(self, room_id: int, scene_objects: Dict[int, Dict[str, Any]]) -> Optional[str]:
-        """Infer a human-readable room name from the objects assigned to a region.
+    def _rebuild_class_to_room_type(self) -> None:
+        """Rebuild the reverse index: class_name -> room_type from _indicator_map."""
+        self._class_to_room_type = {}
+        for room_type, classes in self._indicator_map.items():
+            for cls in classes:
+                if cls not in self._class_to_room_type:
+                    self._class_to_room_type[cls] = room_type
 
-        Uses the LLM (call_openai_api) to classify the room type based on object classes.
-        Only called when the region has >= 2 objects and has not been named yet.
-        Returns None on failure (never blocks the main loop).
+    def configure_drift_detection(self, cfg_room_naming) -> None:
+        """Load drift detection config from OmegaConf room_naming sub-config.
+
+        Call once after ExplicitMemoryGraphBuilder is created, e.g.:
+            emg.configure_drift_detection(cfg.room_naming)
         """
-        obj_ids = self._region_to_objs.get(room_id, [])
-        if len(obj_ids) < 2:
-            return None
+        try:
+            self.drift_threshold = int(cfg_room_naming.get("drift_threshold", self.drift_threshold))
+            self.indicator_conf_threshold = float(cfg_room_naming.get("indicator_conf_threshold", self.indicator_conf_threshold))
+            indicator_map = cfg_room_naming.get("indicator_map", None)
+            if indicator_map is not None:
+                self._indicator_map = {k: list(v) for k, v in indicator_map.items()}
+                self._rebuild_class_to_room_type()
+        except Exception as e:
+            import logging
+            logging.warning(f"configure_drift_detection failed, using defaults: {e}")
 
-        # Collect unique class names
-        class_names = set()
-        for oid in obj_ids:
-            obj = scene_objects.get(oid, {})
-            cn = obj.get("class_name", None)
-            if cn:
-                class_names.add(cn)
-        if not class_names:
+    def _infer_room_name(self, room_id: int, scene_objects: Dict[int, Dict[str, Any]]) -> Optional[str]:
+        """Infer a human-readable room name from the objects assigned to a region via LLM.
+
+        Non-blocking: returns None on any failure. Never raises.
+        Uses an inference lock to prevent duplicate concurrent calls.
+        """
+        import logging
+
+        # Inference lock: skip if already being inferred
+        if room_id in self._inferring:
             return None
+        self._inferring.add(room_id)
 
         try:
+            obj_ids = self._region_to_objs.get(room_id, [])
+            if len(obj_ids) < 2:
+                return None
+
+            # Collect unique class names
+            class_names = set()
+            for oid in obj_ids:
+                obj = scene_objects.get(oid, {})
+                cn = obj.get("class_name", None)
+                if cn:
+                    class_names.add(cn)
+            if not class_names:
+                return None
+
             from src.eval_utils_gpt_aeqa import call_openai_api
             objects_str = ", ".join(sorted(class_names))
             sys_prompt = "You are a room classifier."
             content = [(
                 f"Based on the objects [{objects_str}], determine the room type from: "
-                "bedroom, living room, kitchen, bathroom, dining room, office, hallway, closet, laundry room, garage, other. "
+                "bedroom, living room, kitchen, bathroom, dining room, office, hallway, "
+                "closet, laundry room, garage, other. "
                 "Reply with ONLY the room type name, nothing else. Room type:",
             )]
             response = call_openai_api(sys_prompt, content)
             if response is not None:
                 name = response.strip().lower()
-                # Validate against known types
                 valid_types = {
                     "bedroom", "living room", "kitchen", "bathroom",
                     "dining room", "office", "hallway", "closet",
                     "laundry room", "garage", "other",
                 }
                 if name in valid_types:
+                    logging.info(f"LLM inferred Room {room_id} name: '{name}' (objects: {objects_str})")
                     return name
-                # Try fuzzy match: pick the first valid type that is a substring
                 for vt in valid_types:
                     if vt in name:
+                        logging.info(f"LLM inferred Room {room_id} name (fuzzy): '{vt}' from response='{name}'")
                         return vt
-                return name  # return raw response as best-effort
+                logging.info(f"LLM inferred Room {room_id} name (raw): '{name}'")
+                return name
         except Exception as e:
             import logging
             logging.debug(f"Room name inference failed for room {room_id}: {e}")
+        finally:
+            self._inferring.discard(room_id)
         return None
 
     def get_room_name(self, room_id: int, scene_objects: Optional[Dict[int, Dict[str, Any]]] = None) -> Optional[str]:
         """Return the room name for a given region_id.
 
-        If the room has not been named yet and enable_room_naming is True,
-        tries to infer the name via LLM. Falls back to None on failure.
+        If named, returns the cached name. Otherwise attempts LLM inference.
+        Falls back to 'Room_{room_id}' to ensure Prompt never has None.
         """
         rn = self._regions.get(room_id)
         if rn is None:
-            return None
+            return f"Room_{room_id}"
         if rn.name is not None:
             return rn.name
-        if not self.enable_room_naming:
-            return None
-        if scene_objects is None:
-            return None
-        # Attempt inference
+        if not self.enable_room_naming or scene_objects is None:
+            return f"Room_{room_id}"
+        # Attempt inference (non-blocking; returns None on failure)
         inferred = self._infer_room_name(room_id, scene_objects)
         if inferred is not None:
             rn.name = inferred
-        return rn.name
+            rn.semantic_version += 1
+        # Always return a non-None string
+        return rn.name if rn.name is not None else f"Room_{room_id}"
+
+    def check_semantic_drift(self, room_id: int, scene_objects: Dict[int, Dict[str, Any]]) -> None:
+        """Detect semantic drift in a named room and re-infer name if needed.
+
+        If a named room (e.g. 'bedroom') suddenly has >= drift_threshold indicator
+        objects from a *different* room type with confidence > indicator_conf_threshold,
+        the name is reset to None and re-inferred via LLM.
+        """
+        import logging
+
+        rn = self._regions.get(room_id)
+        if rn is None or rn.name is None:
+            return  # unnamed rooms need initial inference, not drift detection
+
+        # If currently being inferred, skip drift check
+        if room_id in self._inferring:
+            return
+
+        current_type = rn.name.replace(" ", "_").lower()
+        obj_ids = self._region_to_objs.get(room_id, [])
+
+        # Count indicator objects from conflicting room types
+        conflict_counts: Dict[str, int] = {}
+        for oid in obj_ids:
+            obj = scene_objects.get(oid, {})
+            conf = float(obj.get("conf", 0.0))
+            if conf < self.indicator_conf_threshold:
+                continue
+            cn = obj.get("class_name", None)
+            if cn is None:
+                continue
+            room_type = self._class_to_room_type.get(cn)
+            if room_type is not None and room_type != current_type:
+                conflict_counts[room_type] = conflict_counts.get(room_type, 0) + 1
+
+        # Check if any conflicting type exceeds threshold
+        for conflict_type, count in conflict_counts.items():
+            if count >= self.drift_threshold:
+                old_name = rn.name
+                logging.info(
+                    f"Detected semantic drift in Room {room_id}: '{old_name}' -> "
+                    f"Re-inferring... ({count} '{conflict_type}' indicators found)"
+                )
+                rn.name = None
+                rn.semantic_version += 1
+                # Re-infer immediately (non-blocking)
+                inferred = self._infer_room_name(room_id, scene_objects)
+                if inferred is not None:
+                    rn.name = inferred
+                    rn.semantic_version += 1
+                    logging.info(f"Room {room_id} re-named: '{old_name}' -> '{rn.name}'")
+                else:
+                    logging.info(f"Room {room_id} name reset from '{old_name}', inference pending.")
+                break  # one drift trigger per call is enough
 
     def add_snapshot_to_room(self, snapshot_image: str, room_id: int) -> None:
         """Associate a snapshot filename with a region (room)."""
@@ -223,13 +333,7 @@ class ExplicitMemoryGraphBuilder:
             rn.snapshots.append(snapshot_image)
 
     def get_room_exploration_status(self) -> str:
-        """Generate a human-readable summary of exploration status per room.
-
-        Returns a multi-line string like:
-            Room 0 (kitchen): Well explored (5 snapshots)
-            Room 1: Partially explored (2 snapshots)
-            Room 2: Unexplored (0 snapshots)
-        """
+        """Generate a human-readable summary of exploration status per room."""
         lines = []
         for rid in sorted(self._regions.keys()):
             rn = self._regions[rid]
@@ -240,51 +344,41 @@ class ExplicitMemoryGraphBuilder:
                 status = "Partially explored"
             else:
                 status = "Well explored"
-            if rn.name:
-                lines.append(f"Room {rid} ({rn.name}): {status} ({n_snap} snapshots)")
-            else:
-                lines.append(f"Room {rid}: {status} ({n_snap} snapshots)")
+            display_name = rn.name if rn.name else f"Room_{rid}"
+            lines.append(f"Room {rid} ({display_name}): {status} ({n_snap} snapshots)")
         if not lines:
             return "No rooms discovered yet."
         return "\n".join(lines)
 
     def handle_room_merge(self, old_id: int, new_id: int,
                           scene_snapshots: Optional[Dict[str, Any]] = None) -> None:
-        """Merge old_id room into new_id room.
-
-        Migrates snapshots, objects, and updates _obj_to_region.
-        Optionally updates scene snapshot references if provided.
-        """
+        """Merge old_id room into new_id room, migrating all data and updating scene refs."""
         old_rn = self._regions.get(old_id)
         new_rn = self._regions.get(new_id)
         if old_rn is None or new_rn is None:
             return
 
-        # Migrate snapshots
         for sname in old_rn.snapshots:
             if sname not in new_rn.snapshots:
                 new_rn.snapshots.append(sname)
         old_rn.snapshots.clear()
 
-        # Migrate objects
         for oid in list(old_rn.objects):
             if oid not in new_rn.objects:
                 new_rn.objects.append(oid)
             self._obj_to_region[oid] = new_id
         old_rn.objects.clear()
 
-        # Sync reverse index
         old_objs = self._region_to_objs.pop(old_id, [])
         self._region_to_objs.setdefault(new_id, [])
         for oid in old_objs:
             if oid not in self._region_to_objs[new_id]:
                 self._region_to_objs[new_id].append(oid)
 
-        # Propagate new room name to merged region if new has no name yet
         if new_rn.name is None and old_rn.name is not None:
             new_rn.name = old_rn.name
+            new_rn.semantic_version += 1
 
-        # Update scene snapshot references if provided
         if scene_snapshots is not None:
             for _sname, snap in scene_snapshots.items():
                 if getattr(snap, "room_id", None) == old_id:
@@ -465,6 +559,15 @@ class ExplicitMemoryGraphBuilder:
                 self._region_to_objs.setdefault(cur_region_id, [])
                 if obj_id not in self._region_to_objs[cur_region_id]:
                     self._region_to_objs[cur_region_id].append(obj_id)
+
+        # ── Semantic drift detection for all named regions ───────────────
+        for rid in list(self._regions.keys()):
+            rn = self._regions[rid]
+            if rn.name is not None:
+                try:
+                    self.check_semantic_drift(rid, scene_objects)
+                except Exception as _e:
+                    pass  # never block the navigation loop
 
     def _compute_dynamic_map_bounds(
         self, scene_objects: Dict[int, Dict[str, Any]]
@@ -903,6 +1006,6 @@ class ExplicitMemoryGraphBuilder:
                 except Exception as e:
                     import logging
                     logging.warning(f"Visualization mode '{mode_str}' failed: {e}")
-        
+
 
 
