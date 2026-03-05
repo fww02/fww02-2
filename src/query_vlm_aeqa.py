@@ -32,6 +32,13 @@ def query_vlm_for_response(
     }
     step_dict["obj_map"] = object_id_to_name
 
+    # Build indicator reverse index from builder for semantic conflict annotation
+    indicator_map = {}
+    class_to_room_type = {}
+    if hasattr(scene, 'builder') and scene.builder is not None:
+        indicator_map = getattr(scene.builder, '_indicator_map', {})
+        class_to_room_type = getattr(scene.builder, '_class_to_room_type', {})
+
     step_dict["snapshot_objects"] = {}
     step_dict["snapshot_imgs"] = {}
     step_dict["snapshot_room_ids"] = {}
@@ -40,13 +47,32 @@ def query_vlm_for_response(
         step_dict["snapshot_objects"][rgb_id] = snapshot.cluster
         step_dict["snapshot_imgs"][rgb_id] = scene.all_observations[rgb_id]
         step_dict["snapshot_room_ids"][rgb_id] = snapshot.room_id
-        # Prefer human-readable room_name, fallback to "Room <id>" or None
+
+        # Build base room label (never None)
         if snapshot.room_name is not None:
-            step_dict["snapshot_room_labels"][rgb_id] = snapshot.room_name
+            base_label = str(snapshot.room_name)
         elif snapshot.room_id is not None:
-            step_dict["snapshot_room_labels"][rgb_id] = f"Room {snapshot.room_id}"
+            base_label = f"Room_{snapshot.room_id}"
         else:
-            step_dict["snapshot_room_labels"][rgb_id] = None
+            base_label = "unknown area"
+
+        # Detect semantic conflict: objects in this snapshot that belong to a different room type
+        if class_to_room_type and snapshot.room_name is not None:
+            current_type = snapshot.room_name.replace(" ", "_").lower()
+            conflict_types = set()
+            for obj_id in snapshot.cluster:
+                obj = scene.objects.get(obj_id, {})
+                cn = obj.get("class_name", None) if obj else None
+                if cn is None:
+                    continue
+                assigned_type = class_to_room_type.get(cn)
+                if assigned_type is not None and assigned_type != current_type:
+                    conflict_types.add(assigned_type.replace("_", " "))
+            if conflict_types:
+                conflict_str = ", ".join(sorted(conflict_types))
+                base_label = f"{base_label}, contains {conflict_str} objects"
+
+        step_dict["snapshot_room_labels"][rgb_id] = base_label
 
     # prepare frontier
     step_dict["frontier_imgs"] = [
