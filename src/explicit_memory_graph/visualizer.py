@@ -1213,6 +1213,17 @@ class SceneGraphVisualizer:
             obj_centroid_2d = obj_centroids_2d.get(str(obj_id))
             if obj_centroid_2d is None:
                 continue
+            # 安全提取 2D 坐标：确保是 (2,) 向量
+            try:
+                obj_centroid_2d = np.asarray(obj_centroid_2d).flatten()
+                if len(obj_centroid_2d) >= 3:
+                    obj_centroid_2d = obj_centroid_2d[[0, 2]]
+                elif len(obj_centroid_2d) == 2:
+                    pass  # 已经是 2D
+                else:
+                    continue  # 格式异常，跳过
+            except Exception:
+                continue
             
             # 判断是否为冲突节点
             obj_color, obj_marker = self._get_object_style(obj_id, decision_history)
@@ -1523,4 +1534,79 @@ class SceneGraphVisualizer:
         return centroids
 
     def _get_object_centroid_2d(self, obj: Dict[str, Any]) -> Optional[np.ndarray]:
-        """获取单个物体的 2D 中心点（XZ 平面）"""
+        """获取单个物体的 2D 中心点（XZ 平面）。
+
+        健壮版本：支持 3D (x,y,z) 和 2D (x,z) 输入，防止越界切片。
+        """
+        bbox = obj.get("bbox", None)
+        if bbox is not None and hasattr(bbox, "center"):
+            try:
+                center = np.asarray(bbox.center).flatten()
+                if center.ndim == 0 or len(center) == 0:
+                    return None
+                if len(center) >= 3:
+                    # Habitat 坐标：取 X (index 0) 和 Z (index 2)
+                    return np.array([center[0], center[2]], dtype=np.float64)
+                elif len(center) == 2:
+                    return np.array([center[0], center[1]], dtype=np.float64)
+                else:
+                    return None
+            except Exception:
+                return None
+
+        # 回退：从点云取中心
+        pcd = obj.get("pcd", None)
+        if pcd is not None and hasattr(pcd, "points"):
+            try:
+                pts = np.asarray(pcd.points)
+                if len(pts) == 0:
+                    return None
+                center = pts.mean(axis=0).flatten()
+                if len(center) >= 3:
+                    return np.array([center[0], center[2]], dtype=np.float64)
+                elif len(center) == 2:
+                    return np.array([center[0], center[1]], dtype=np.float64)
+            except Exception:
+                return None
+
+        return None
+
+    def _add_legend(self, ax) -> None:
+        """
+        在拓扑图的 axes 上添加图例。
+
+        收集画布中所有已有的 Artist（Line2D、PathCollection 等）的 label，
+        去除以 '_' 开头的匿名句柄，去重后在图像右侧生成统一图例说明。
+        如果没有任何有效句柄，则不绘制图例（避免空图例警告）。
+        """
+        try:
+            handles, labels = ax.get_legend_handles_labels()
+
+            # 去重：保留第一次出现的 label
+            seen = {}
+            dedup_handles, dedup_labels = [], []
+            for h, l in zip(handles, labels):
+                if l.startswith("_"):
+                    continue   # 匿名 artist，跳过
+                if l not in seen:
+                    seen[l] = True
+                    dedup_handles.append(h)
+                    dedup_labels.append(l)
+
+            if not dedup_handles:
+                return  # 没有可展示的图例条目
+
+            ax.legend(
+                dedup_handles,
+                dedup_labels,
+                loc="upper right",
+                fontsize=7,
+                framealpha=0.85,
+                fancybox=True,
+                frameon=True,
+                edgecolor="#CCCCCC",
+                borderpad=0.5,
+                labelspacing=0.4,
+            )
+        except Exception as e:
+            self.logger.debug(f"_add_legend failed (non-fatal): {e}")
