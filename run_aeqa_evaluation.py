@@ -138,6 +138,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
         )
         emg.start_episode(episode_id=question_id, scene_id=scene_id)
 
+        # Link builder to scene for room naming / snapshot-room association
+        scene.builder = emg
+        # Apply room naming config switch
+        if hasattr(cfg, 'enable_room_naming'):
+            emg.enable_room_naming = bool(cfg.enable_room_naming)
+
         logging.info(f"\n\nQuestion id {question_id} initialization successful!")
 
         # run steps
@@ -246,6 +252,10 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
             logging.info(
                 f"Step {cnt_step}, update snapshots, {len(scene.objects)} objects, {len(scene.snapshots)} snapshots"
             )
+
+            # (2.5) Assign room IDs to snapshots via majority vote
+            if hasattr(emg, 'obj_to_region'):
+                scene.update_snapshot_rooms(emg.obj_to_region)
 
             # (3) Update the Frontier Snapshots
             update_success = tsdf_planner.update_frontier_map(
