@@ -169,6 +169,9 @@ class Scene:
             random_state=66,
         )
 
+        # reference to ExplicitMemoryGraphBuilder (set externally after creation)
+        self.builder = None
+
         # setup detection and segmentation models
         self.detection_model = detection_model
         self.detection_model.set_classes(self.obj_classes.get_classes_arr())
@@ -192,6 +195,44 @@ class Scene:
         self.snapshots = {}
         self.frames = {}
         self.all_observations = {}
+
+    def update_snapshot_rooms(self, obj_to_region: dict):
+        """Assign room_id and room_name to each snapshot by majority vote over its cluster's region mapping.
+
+        Also registers each snapshot with its room in the builder (if available)
+        and attempts to infer a human-readable room name via the builder.
+
+        Args:
+            obj_to_region: dict mapping object_id (int) -> region_id (int),
+                           typically from ExplicitMemoryGraphBuilder.obj_to_region.
+        """
+        for snapshot in self.snapshots.values():
+            region_ids = [
+                obj_to_region[obj_id]
+                for obj_id in snapshot.cluster
+                if obj_id in obj_to_region
+            ]
+            if region_ids:
+                snapshot.room_id = Counter(region_ids).most_common(1)[0][0]
+            else:
+                snapshot.room_id = None
+                snapshot.room_name = None
+                continue
+
+            # Try to get/infer room name via builder
+            if self.builder is not None:
+                try:
+                    name = self.builder.get_room_name(snapshot.room_id, scene_objects=self.objects)
+                    snapshot.room_name = name
+                except Exception:
+                    snapshot.room_name = None
+                # Register snapshot → room association
+                try:
+                    self.builder.add_snapshot_to_room(snapshot.image, snapshot.room_id)
+                except Exception:
+                    pass
+            else:
+                snapshot.room_name = None
 
     def get_observation(self, pts, angle):
         agent_state = habitat_sim.AgentState()
@@ -1975,6 +2016,17 @@ class Scene:
             map_width=map_width,
             show_frontier_glow=show_frontier_glow,
         )
+
+        # ── 叠加物体实例色块（黑底纯色风格）──────────────────────────────
+        obj_layer = self._render_object_instance_map(
+            map_height=map_height,
+            map_width=map_width,
+            min_bound=min_bound_padded,
+            meters_per_pixel=meters_per_pixel,
+        )
+        # 将非黑区域（有物体色块）叠加到探索底图上
+        obj_mask = obj_layer.any(axis=2)   # (H, W) bool：有物体的像素
+        rgb[obj_mask] = obj_layer[obj_mask]
         
         # ==================== Step 8: 生成图标避让掩码 ====================
         # 标记边界线和密集区域，用于图标布局时避免重叠
@@ -2002,6 +2054,154 @@ class Scene:
         }
         
         return rgb, map_bounds, meters_per_pixel, masks
+
+    def _compute_headings_from_trajectory(self, traj_pixels: np.ndarray) -> np.ndarray:
+        """
+        从像素坐标轨迹计算每个点的瞬时航向角（弧度）。
+
+        Habitat 坐标系：X 向右，Z 向前。在 2D 投影后 traj_pixels[:,0]=X, traj_pixels[:,1]=Z。
+        arctan2(dz, dx) 给出从 +X 轴出发的逆时针角度；这里使用 atan2(Δcol, Δrow)
+        的约定，与 _draw_fov_sector 保持一致。
+
+        Args:
+            traj_pixels: (N, 2) 像素坐标序列，每行 [px_x, px_z]
+
+        Returns:
+            (N,) 朝向角数组（弧度）
+        """
+        n = len(traj_pixels)
+        headings = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            if i < n - 1:
+                dx = traj_pixels[i + 1, 0] - traj_pixels[i, 0]
+                dz = traj_pixels[i + 1, 1] - traj_pixels[i, 1]
+            else:
+                # 末尾点沿用前一点方向
+                dx = traj_pixels[i, 0] - traj_pixels[i - 1, 0] if i > 0 else 0.0
+                dz = traj_pixels[i, 1] - traj_pixels[i - 1, 1] if i > 0 else 0.0
+            if abs(dx) < 1e-6 and abs(dz) < 1e-6:
+                headings[i] = headings[i - 1] if i > 0 else 0.0
+            else:
+                headings[i] = np.arctan2(dz, dx)
+        return headings
+
+    def _draw_fov_sector(
+        self,
+        mask: np.ndarray,
+        px: int, py: int,
+        heading: float,
+        fov_rad: float,
+        range_px: int,
+        map_width: int, map_height: int,
+    ) -> None:
+        """在掩码上绘制扇形视野区域（无视线遮挡）。"""
+        import cv2
+        half_fov = fov_rad / 2.0
+        # 生成扇形顶点
+        n_pts = 32
+        pts = [[px, py]]
+        for k in range(n_pts + 1):
+            angle = heading - half_fov + fov_rad * k / n_pts
+            ex = int(np.clip(px + range_px * np.cos(angle), 0, map_width - 1))
+            ey = int(np.clip(py + range_px * np.sin(angle), 0, map_height - 1))
+            pts.append([ex, ey])
+        pts_arr = np.array(pts, dtype=np.int32)
+        cv2.fillPoly(mask, [pts_arr], 255)
+
+    def _draw_fov_with_los(
+        self,
+        mask: np.ndarray,
+        occupancy: np.ndarray,
+        px: int, py: int,
+        heading: float,
+        fov_rad: float,
+        range_px: int,
+        map_width: int, map_height: int,
+    ) -> None:
+        """在掩码上绘制扇形视野区域（带简单视线遮挡检测）。"""
+        import cv2
+        half_fov = fov_rad / 2.0
+        n_rays = 64
+        pts = [[px, py]]
+        for k in range(n_rays + 1):
+            angle = heading - half_fov + fov_rad * k / n_rays
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            end_px, end_py = px, py
+            for r in range(1, range_px + 1):
+                cx = int(px + r * cos_a)
+                cy = int(py + r * sin_a)
+                if not (0 <= cx < map_width and 0 <= cy < map_height):
+                    break
+                if occupancy[cy, cx] == 0:  # 障碍物
+                    break
+                end_px, end_py = cx, cy
+            pts.append([end_px, end_py])
+        pts_arr = np.array(pts, dtype=np.int32)
+        cv2.fillPoly(mask, [pts_arr], 255)
+
+    def _render_object_instance_map(
+        self,
+        map_height: int,
+        map_width: int,
+        min_bound: np.ndarray,
+        meters_per_pixel: float,
+    ) -> np.ndarray:
+        """
+        黑背景 + 每个物体实例分配固定纯色色块的俯视图。
+
+        - 背景：纯黑 (0, 0, 0)
+        - 每个 object_id 根据哈希分配一种高饱和度颜色
+        - 根据 bbox 或 pcd 在 XZ 平面投影，填充对应色块
+        """
+        import cv2
+
+        rgb = np.zeros((map_height, map_width, 3), dtype=np.uint8)
+
+        def _obj_color(obj_id: int) -> tuple:
+            """为 object_id 分配稳定的高饱和度颜色（HSV → RGB）。"""
+            import colorsys
+            hue = (obj_id * 137.508) % 360.0  # 黄金角散列，确保颜色间距大
+            r, g, b = colorsys.hsv_to_rgb(hue / 360.0, 0.85, 0.95)
+            return (int(r * 255), int(g * 255), int(b * 255))
+
+        for obj_id, obj in self.objects.items():
+            color = _obj_color(int(obj_id))
+            bbox = obj.get("bbox", None)
+            pcd  = obj.get("pcd", None)
+
+            drawn = False
+
+            # ── 优先用 bbox 的 8 个角点投影到 XZ 平面 ──────────────────────
+            if bbox is not None and hasattr(bbox, "get_box_points"):
+                try:
+                    pts_3d = np.asarray(bbox.get_box_points())  # (8, 3)
+                    xs = ((pts_3d[:, 0] - min_bound[0]) / meters_per_pixel).astype(int)
+                    zs = ((pts_3d[:, 2] - min_bound[2]) / meters_per_pixel).astype(int)
+                    xs = np.clip(xs, 0, map_width - 1)
+                    zs = np.clip(zs, 0, map_height - 1)
+                    hull_pts = np.stack([xs, zs], axis=1).reshape(-1, 1, 2).astype(np.int32)
+                    hull = cv2.convexHull(hull_pts)
+                    cv2.fillPoly(rgb, [hull], color)
+                    drawn = True
+                except Exception:
+                    pass
+
+            # ── 回退：用点云投影 ────────────────────────────────────────────
+            if not drawn and pcd is not None and hasattr(pcd, "points"):
+                try:
+                    pts_3d = np.asarray(pcd.points)
+                    if len(pts_3d) > 0:
+                        xs = ((pts_3d[:, 0] - min_bound[0]) / meters_per_pixel).astype(int)
+                        zs = ((pts_3d[:, 2] - min_bound[2]) / meters_per_pixel).astype(int)
+                        xs = np.clip(xs, 0, map_width - 1)
+                        zs = np.clip(zs, 0, map_height - 1)
+                        hull_pts = np.stack([xs, zs], axis=1).reshape(-1, 1, 2).astype(np.int32)
+                        hull = cv2.convexHull(hull_pts)
+                        cv2.fillPoly(rgb, [hull], color)
+                except Exception:
+                    pass
+
+        return rgb
 
     def _render_clean_exploration_map(
         self,
