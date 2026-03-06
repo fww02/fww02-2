@@ -40,6 +40,9 @@ class Frontier:
     feature: torch.Tensor = (
         None  # the image feature of the snapshot, not used when generating data
     )
+    # Room-aware exploration: linked to nearest semantic region
+    room_id: Optional[int] = None
+    room_name: Optional[str] = None
 
     def __eq__(self, other):
         if not isinstance(other, Frontier):
