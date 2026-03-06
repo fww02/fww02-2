@@ -149,6 +149,11 @@ class ExplicitMemoryGraphBuilder:
         self._class_to_room_type: Dict[str, str] = {}
         self._rebuild_class_to_room_type()
 
+        # Room-aware planning (loaded via configure_room_aware_planning)
+        self.room_aware_enabled: bool = True
+        self._object_room_priors: Dict[str, str] = {}
+        self.transition_zone_threshold: int = 2
+
         # metadata
         self._created = False
         self._episode_info: Dict[str, Any] = {}
@@ -187,6 +192,56 @@ class ExplicitMemoryGraphBuilder:
         except Exception as e:
             import logging
             logging.warning(f"configure_drift_detection failed, using defaults: {e}")
+
+    def configure_room_aware_planning(self, cfg_rap) -> None:
+        """Load room-aware planning config (object_room_priors, transition zone threshold).
+
+        Args:
+            cfg_rap: OmegaConf sub-config ``cfg.room_aware_planning``.
+        """
+        try:
+            self.room_aware_enabled = bool(cfg_rap.get("enabled", True))
+            priors = cfg_rap.get("object_room_priors", None)
+            if priors is not None:
+                self._object_room_priors = dict(priors)
+            self.transition_zone_threshold = int(cfg_rap.get("transition_zone_threshold", 2))
+        except Exception as e:
+            import logging
+            logging.warning(f"configure_room_aware_planning failed, using defaults: {e}")
+
+    def detect_transition_zone(self, room_id: int, scene_objects: Dict[int, Dict[str, Any]]) -> bool:
+        """Check if a region is a transition zone (open-plan kitchen/living/dining).
+
+        A region is a transition zone if indicator objects from >= 2 different
+        room types each exceed ``transition_zone_threshold``.
+
+        Returns True if the region should be labelled as "transition" area.
+        """
+        rn = self._regions.get(room_id)
+        if rn is None:
+            return False
+        obj_ids = self._region_to_objs.get(room_id, [])
+        type_counts: Dict[str, int] = {}
+        for oid in obj_ids:
+            obj = scene_objects.get(oid, {})
+            cn = obj.get("class_name", None)
+            if cn is None:
+                continue
+            rtype = self._class_to_room_type.get(cn)
+            if rtype is not None:
+                type_counts[rtype] = type_counts.get(rtype, 0) + 1
+
+        n_qualifying = sum(1 for c in type_counts.values() if c >= self.transition_zone_threshold)
+        return n_qualifying >= 2
+
+    def get_object_room_priors_text(self) -> str:
+        """Return a formatted string of common object → room location priors for prompt."""
+        if not self._object_room_priors:
+            return ""
+        lines = []
+        for obj_name, room_name in sorted(self._object_room_priors.items()):
+            lines.append(f"  {obj_name} → {room_name}")
+        return "Common object locations:\n" + "\n".join(lines)
 
     def _infer_room_name(self, room_id: int, scene_objects: Dict[int, Dict[str, Any]]) -> Optional[str]:
         """Infer a human-readable room name from the objects assigned to a region via LLM.
@@ -331,6 +386,110 @@ class ExplicitMemoryGraphBuilder:
             return
         if snapshot_image not in rn.snapshots:
             rn.snapshots.append(snapshot_image)
+
+    def get_nearest_region_info(
+        self,
+        frontier_pos_habitat: np.ndarray,
+        scene_objects: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Find the nearest semantic region to a frontier position.
+
+        Uses Euclidean distance on the XZ plane between the frontier position
+        and the centroid of each region's assigned objects. Falls back to
+        mask-centroid distance if no objects are available.
+
+        Args:
+            frontier_pos_habitat: (3,) or (2,) world coordinate of the frontier.
+            scene_objects: Scene.objects dict for object centroid lookup.
+
+        Returns:
+            (region_id, room_name) or (None, None) if no regions exist.
+        """
+        if not self._regions:
+            return None, None
+
+        # Extract 2D coordinate
+        fp = np.asarray(frontier_pos_habitat).flatten()
+        if len(fp) >= 3:
+            fp_xz = fp[[0, 2]]
+        elif len(fp) == 2:
+            fp_xz = fp
+        else:
+            return None, None
+
+        best_rid = None
+        best_dist = float('inf')
+
+        for rid, rn in self._regions.items():
+            centroid = None
+
+            # Method 1: average object positions assigned to this region
+            obj_ids = self._region_to_objs.get(rid, [])
+            if scene_objects and obj_ids:
+                positions = []
+                for oid in obj_ids:
+                    obj = scene_objects.get(oid, {})
+                    bbox = obj.get("bbox", None)
+                    if bbox is not None and hasattr(bbox, "center"):
+                        c = np.asarray(bbox.center)
+                        positions.append(c[[0, 2]])
+                if positions:
+                    centroid = np.mean(positions, axis=0)
+
+            # Method 2: mask centroid (voxel grid units → world)
+            if centroid is None and rn.mask is not None:
+                coords = np.argwhere(rn.mask)
+                if len(coords) > 0:
+                    centroid = coords.mean(axis=0) * self.voxel_size
+
+            if centroid is None:
+                continue
+
+            dist = float(np.linalg.norm(fp_xz - centroid))
+            if dist < best_dist:
+                best_dist = dist
+                best_rid = rid
+
+        if best_rid is None:
+            return None, None
+
+        # Get room name (with lazy LLM inference)
+        room_name = self.get_room_name(best_rid, scene_objects=scene_objects)
+        return best_rid, room_name
+
+    def assign_frontiers_to_rooms(
+        self,
+        frontiers: list,
+        tsdf_planner: Any,
+        scene_objects: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> None:
+        """Assign room_id and room_name to each frontier (in-place).
+
+        Called after frontiers are generated and before prompt construction.
+        Converts each frontier's voxel position to Habitat world coordinates
+        via ``tsdf_planner.voxel2habitat``, then finds the nearest region.
+
+        Args:
+            frontiers: list of Frontier objects (mutated in-place).
+            tsdf_planner: TSDFPlanner instance (for coordinate conversion).
+            scene_objects: Scene.objects dict.
+        """
+        import logging
+        for f in frontiers:
+            try:
+                # Frontier.position is in voxel grid coordinates (integer)
+                if hasattr(tsdf_planner, 'voxel2habitat'):
+                    hab_pos = tsdf_planner.voxel2habitat(f.position)
+                else:
+                    # Rough fallback: voxel * size
+                    hab_pos = np.asarray(f.position, dtype=float) * self.voxel_size
+                rid, rname = self.get_nearest_region_info(hab_pos, scene_objects)
+                f.room_id = rid
+                f.room_name = rname if rname else ("unknown area" if rid is None else f"Room_{rid}")
+            except Exception as _e:
+                f.room_id = None
+                f.room_name = "unknown area"
+                logging.debug(f"assign_frontiers_to_rooms failed for frontier {f.frontier_id}: {_e}")
 
     def get_room_exploration_status(self) -> str:
         """Generate a human-readable summary of exploration status per room."""
