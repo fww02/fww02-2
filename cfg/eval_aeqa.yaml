@@ -35,6 +35,45 @@ room_naming:
     bedroom: ['bed', 'wardrobe']
     bathroom: ['toilet', 'shower', 'bathtub']
 
+# Room-aware exploration planning
+room_aware_planning:
+  enabled: true
+  # Common-sense object → room priors (used in prompt for VLM reasoning)
+  object_room_priors:
+    refrigerator: kitchen
+    microwave: kitchen
+    oven: kitchen
+    stove: kitchen
+    dishwasher: kitchen
+    blender: kitchen
+    toaster: kitchen
+    sink: kitchen
+    bed: bedroom
+    wardrobe: bedroom
+    nightstand: bedroom
+    dresser: bedroom
+    pillow: bedroom
+    blanket: bedroom
+    toilet: bathroom
+    shower: bathroom
+    bathtub: bathroom
+    towel rack: bathroom
+    sofa: living room
+    couch: living room
+    television: living room
+    tv: living room
+    fireplace: living room
+    dining table: dining room
+    desk: office
+    office chair: office
+    computer: office
+    bookshelf: office
+    washer: laundry room
+    dryer: laundry room
+  # Semantic zone detection: when indicator objects from multiple rooms co-occur,
+  # mark the region as a transition zone instead of forcing a single label.
+  transition_zone_threshold: 2  # min indicators from 2+ room types to mark as transition
+
 # camera, image
 camera_height: 1.5
 camera_tilt_deg: -30
