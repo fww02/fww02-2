@@ -149,6 +149,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
                 emg.configure_drift_detection(cfg.room_naming)
             except Exception as _e:
                 logging.warning(f"configure_drift_detection failed: {_e}")
+        # Load room-aware planning config (object priors, transition zones)
+        if hasattr(cfg, 'room_aware_planning'):
+            try:
+                emg.configure_room_aware_planning(cfg.room_aware_planning)
+            except Exception as _e:
+                logging.warning(f"configure_room_aware_planning failed: {_e}")
 
         logging.info(f"\n\nQuestion id {question_id} initialization successful!")
 
@@ -280,6 +286,18 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
                         f"Question id {question_id} invalid: update_frontier_map failed!"
                     )
                     break
+
+            # (3.5) Assign room IDs to frontiers (must happen before prompt construction)
+            try:
+                emg.assign_frontiers_to_rooms(
+                    frontiers=tsdf_planner.frontiers,
+                    tsdf_planner=tsdf_planner,
+                    scene_objects=scene.objects,
+                )
+                for _fi, _f in enumerate(tsdf_planner.frontiers):
+                    logging.info(f"Frontier {_fi} -> room='{_f.room_name}' (id={_f.room_id})")
+            except Exception as _e:
+                logging.warning(f"assign_frontiers_to_rooms failed: {_e}")
 
             # (4) Choose the next navigation point by querying the VLM
             if cfg.choose_every_step:
